@@ -1,0 +1,25 @@
+# ---- credentials: never commit ----
+.env
+*.env
+!*.env.example
+acctoken-imagegen.env
+.env.*
+*_token.txt
+*.pem
+*.key
+
+# ---- runtime / caches ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.cache/
+*.egg-info/
+
+# ---- generated artifacts ----
+output/
+*.log
+*.tmp
+
+# ---- macOS ----
+.DS_Store

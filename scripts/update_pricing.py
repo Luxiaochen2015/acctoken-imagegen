@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Regenerate references/models.md from the relay's live pricing endpoint.
+
+Source of truth for prices is the relay itself: GET /api/pricing returns the same
+data the pricing web page renders, and it is the only place the numbers are
+guaranteed current. This script pulls that, keeps the image-generation models, and
+writes a Markdown snapshot. It also compares the live prices against
+scripts/model_catalog.py and warns about any drift, so the cost-aware selector
+never silently picks on stale numbers.
+
+Run it (through the skill's interpreter resolver) with:
+
+    bash scripts/update_pricing.sh
+
+No API key is required: /api/pricing is public.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import time
+from pathlib import Path
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+OUT_PATH = SKILL_DIR / "references" / "models.md"
+PRICING_URL = "https://www.acctoken.com/api/pricing"
+
+sys.path.insert(0, str(SKILL_DIR / "scripts"))
+try:
+    from model_catalog import RATIO_TO_CNY_PER_M  # type: ignore
+except ImportError:  # keep working if the catalog is missing
+    RATIO_TO_CNY_PER_M = 2.0
+
+# A model is an image model if it carries one of these tags and no video tag.
+IMAGE_TAGS = {
+    "图片生成",
+    "文生图",
+    "图像编辑",
+    "抠图",
+    "图片高清",
+    "图层分离",
+    "超分辨率",
+    "透明背景",
+}
+VIDEO_TAGS = {"视频生成", "文生视频", "图生视频", "视频编辑", "视频高清"}
+
+
+def fetch_pricing() -> dict:
+    try:
+        import httpx  # pyright: ignore[reportMissingImports]
+    except ImportError:
+        sys.exit(
+            "httpx is required. Run through scripts/run.sh, or `uv pip install httpx`."
+        )
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        resp = client.get(PRICING_URL)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def is_image_model(entry: dict) -> bool:
+    tags = set((entry.get("tags") or "").split(","))
+    tags = {t.strip() for t in tags if t.strip()}
+    return bool(tags & IMAGE_TAGS) and not (tags & VIDEO_TAGS)
+
+
+def price_text(entry: dict) -> str:
+    if entry.get("quota_type") == 1:
+        price = entry.get("model_price") or 0
+        official = entry.get("official_input_price") or 0
+        if official and abs(official - price) > 1e-9:
+            return f"¥{price:.2f}/张 (官方 ¥{official:.2f})"
+        return f"¥{price:.2f}/张"
+    # Token-priced: turn the relay's ratios into CNY per million tokens with the same
+    # calibration the cost-aware selector uses, so the page and the CLI cannot drift.
+    factor = RATIO_TO_CNY_PER_M
+    ratio = entry.get("model_ratio") or 0
+    comp = entry.get("completion_ratio") or 0
+    image = entry.get("image_ratio") or 1
+    return (
+        f"按 token：文字入 ¥{ratio * factor:.2f}/M、参考图 "
+        f"¥{ratio * image * factor:.2f}/M、出图 ¥{ratio * comp * factor:.2f}/M"
+    )
+
+
+def derived_rates(entry: dict) -> tuple[float, float, float]:
+    """(text_in, image_in, out) CNY per million tokens implied by the relay ratios."""
+    factor = RATIO_TO_CNY_PER_M
+    ratio = entry.get("model_ratio") or 0
+    comp = entry.get("completion_ratio") or 0
+    image = entry.get("image_ratio") or 1
+    return ratio * factor, ratio * image * factor, ratio * comp * factor
+
+
+def load_catalog_prices() -> dict[str, float]:
+    sys.path.insert(0, str(SKILL_DIR / "scripts"))
+    try:
+        import model_catalog  # type: ignore
+
+        return {
+            m.id: m.price_cny
+            for m in model_catalog.CATALOG.values()
+            if m.kind == "image"
+        }
+    except ImportError:
+        return {}
+
+
+def load_token_rates() -> dict[str, tuple[float, float, float]]:
+    """Catalog token rates, keyed by model id, for drift checking."""
+    sys.path.insert(0, str(SKILL_DIR / "scripts"))
+    try:
+        import model_catalog  # type: ignore
+
+        return {
+            m.id: (m.in_text_per_m, m.in_image_per_m, m.out_per_m)
+            for m in model_catalog.CATALOG.values()
+            if m.kind == "token"
+        }
+    except ImportError:
+        return {}
+
+
+def load_excluded() -> dict[str, str]:
+    """Ids the catalog refuses to offer, with the reason (see model_catalog)."""
+    sys.path.insert(0, str(SKILL_DIR / "scripts"))
+    try:
+        import model_catalog  # type: ignore
+
+        return dict(getattr(model_catalog, "EXCLUDED_MODELS", {}))
+    except ImportError:
+        return {}
+
+
+def main() -> int:
+    data = fetch_pricing()
+    entries = [e for e in data.get("data", []) if is_image_model(e)]
+    entries.sort(key=lambda e: (e.get("quota_type") != 1, e.get("model_price") or 0))
+
+    catalog = load_catalog_prices()
+    token_rates = load_token_rates()
+    excluded = load_excluded()
+    drift: list[str] = []
+    seen: set[str] = set()
+
+    drops = [e for e in entries if e.get("model_name") in excluded]
+    entries = [e for e in entries if e.get("model_name") not in excluded]
+
+    lines: list[str] = []
+    lines.append("# Acctoken image models (generated)")
+    lines.append("")
+    lines.append(
+        "Generated by `scripts/update_pricing.sh` from "
+        f"`{PRICING_URL}` on {time.strftime('%Y-%m-%d')} "
+        f"(pricing_version `{data.get('pricing_version', 'unknown')}`)."
+    )
+    lines.append("")
+    lines.append(
+        "The relay bills the Chinese models **per delivered image** (flat CNY), so for "
+        "them a larger size or a higher quality costs the same; `gpt-image-2.5` and "
+        "`gemini-nano-banana-2.1` are billed **per token**. Accessibility is per API "
+        "key: check `scripts/run.sh models`."
+    )
+    lines.append("")
+    lines.append("| Model | Price | Groups | Tags |")
+    lines.append("| --- | --- | --- | --- |")
+    for e in entries:
+        name = e.get("model_name", "")
+        seen.add(name)
+        groups = ", ".join(e.get("enable_groups", []))
+        tags = e.get("tags", "")
+        lines.append(f"| `{name}` | {price_text(e)} | {groups} | {tags} |")
+        live = e.get("model_price")
+        if name in catalog and live is not None and abs(catalog[name] - live) > 1e-9:
+            drift.append(
+                f"{name}: catalog ¥{catalog[name]:.2f} vs live ¥{live:.2f}"
+            )
+        if name in token_rates:
+            live_rates = derived_rates(e)
+            have = token_rates[name]
+            for label, want, got in zip(
+                ("text-in", "image-in", "out"), have, live_rates
+            ):
+                if abs(want - got) > 0.05:
+                    drift.append(
+                        f"{name}: catalog {label} ¥{want:.2f}/M vs live ¥{got:.2f}/M"
+                    )
+    lines.append("")
+    lines.append("## Pricing detail")
+    lines.append("")
+    for e in entries:
+        desc = (e.get("description") or "").strip().replace("\n", " ")
+        if len(desc) > 700:
+            desc = desc[:697] + "..."
+        lines.append(f"### `{e.get('model_name', '')}`")
+        lines.append("")
+        lines.append(f"- Price: {price_text(e)}")
+        lines.append(f"- Groups: {', '.join(e.get('enable_groups', []))}")
+        if desc:
+            lines.append(f"- {desc}")
+        lines.append("")
+
+    if drops:
+        lines.append("## Deliberately not offered")
+        lines.append("")
+        lines.append(
+            "The relay sells these, but this skill's catalog refuses them on purpose, so "
+            "`--model <id>` fails instead of routing work to them:"
+        )
+        lines.append("")
+        for e in drops:
+            name = e.get("model_name", "")
+            lines.append(f"- `{name}` — {excluded.get(name, 'excluded')}.")
+        lines.append("")
+
+    OUT_PATH.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Wrote {OUT_PATH} ({len(entries)} image models)")
+
+    missing = sorted(set(catalog) - seen)
+    if missing:
+        print(
+            "Catalog entries not present in the pricing feed: " + ", ".join(missing),
+            file=sys.stderr,
+        )
+    if drift:
+        print("PRICE DRIFT (update scripts/model_catalog.py):", file=sys.stderr)
+        for d in drift:
+            print(f"  - {d}", file=sys.stderr)
+        return 1
+    print("No price drift between the catalog and the live feed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

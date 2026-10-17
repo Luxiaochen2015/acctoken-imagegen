@@ -1,0 +1,7 @@
+interface:
+  display_name: "Acctoken Image Gen"
+  short_description: "Generate or edit images via Acctoken (cheapest-model auto, ~¥0.02-0.6)"
+  default_prompt: >-
+    Use $acctoken-imagegen to generate or edit an image for this project. Leave --model at
+    its default so the cheapest suitable model is chosen; add --task when the image needs
+    text, a cutout, upscaling, or 4K, and --profile balanced/best when the asset is final.
