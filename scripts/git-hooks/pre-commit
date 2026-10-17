@@ -1,0 +1,29 @@
+#!/bin/sh
+# pre-commit: block accidental credential / generated-asset commits.
+# Enable with:  cp scripts/git-hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+set -e
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+
+# 1) forbidden file names
+bad_names=$(printf '%s\n' "$staged" | grep -Ei '(^|/)\.env($|\.)|\.env$|acctoken-imagegen\.env|\.pem$|\.key$|id_rsa|credentials' || true)
+if [ -n "$bad_names" ]; then
+  echo "pre-commit: refusing to commit credential-like files:" >&2
+  echo "$bad_names" >&2
+  exit 1
+fi
+
+# 2) secret patterns inside staged content
+for f in $staged; do
+  [ -f "$f" ] || continue
+  # The hook itself contains the patterns it looks for.
+  case "$f" in *git-hooks/pre-commit|*".git/hooks/pre-commit") continue ;; esac
+  PAT='(sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_|AKIA[0-9A-Z]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY)'
+  if grep -IEq "$PAT" "$f"; then
+    echo "pre-commit: possible secret found in $f" >&2
+    grep -InE "$PAT" "$f" | cut -c1-40 >&2
+    exit 1
+  fi
+done
+
+exit 0
